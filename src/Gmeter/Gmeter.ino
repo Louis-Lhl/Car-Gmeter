@@ -1,64 +1,60 @@
 /*
- * Car G Meter for Arduino UNO
+ * Car G Meter for Arduino UNO
  *
- * 使用 MPU9xxx 三轨加速径传感器和 0.96\" I2C OLED 显示屏，测量并显示车辆的纵向、横向和垂向加速度。
+ * 使用 MPU9xxx 三轴加速度传感器和 0.96" I2C OLED 显示屏，测量并显示车辆的纵向、横向和垂直加速度。
  * 特性：
- *  - 自动探测 MPU 地址（0x68 或 0x69）和 OLED 地址（0x3C 或 0x3D）
- *  - 设置加速轨量罩为 ±4g（可根据需要调整）
- *  - 上电静置自动校准零偏（包含重力）
- *  - 显示即时 X/Y/Z 轨加速度、水平合成 |H|，以及峰值
- *  - 简易按钮（D2）复位峰值
+ * - 自动检测 MPU 地址 (0x68 或 0x69) 和 OLED 地址 (0x3C 或 0x3D)
+ * - 设定加速度量程为 ±4g（可根据需要调整）
+ * - 上电自动进行零偏校准（包含重力）
+ * - 显示即时 X/Y/Z 加速度值、水平合成 |H|、以及峰值
+ * - 高亮按钮 (D2) 重置峰值
  *
- * 说明：
- *  - 建议传感器模块供电 3.3V。如模块标记支持 3–5V，则可直接接 5V。
- *  - OLED 模块通常支持 3.3–5V；若不确定则接 5V。
- *  - 安装方向：X 朝前、Y 朝左、Z 朝上。
- *  - 使用时请确保上电时车辆静止，保持水平以便正确校准。
+ * 使用注意：
+ * - 建议传感器模块供电 3.3V，如模块标注支持 3–5V，则可直接接 5V。
+ * - OLED 模块请确保支持 3.3–5V；若不确定建议接 5V。
+ * - 安装方向：X 轴朝前，Y 轴向左，Z 轴向上。
+ * - 使用时请将传感器上电并保持静止，保持水平位置校准零偏。
  */
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <math.h>
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-// OLED 显示实例，I2C 接口
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// 默认地址，运行时会探测
 uint8_t OLED_ADDR = 0x3C;
-uint8_t mpuAddr   = 0x68;
+uint8_t mpuAddr   = 0x68;  // will auto-detect 0x68/0x69
 
-// MPU 存储器
+// MPU registers
 #define REG_PWR_MGMT_1   0x6B
 #define REG_ACCEL_CONFIG 0x1C
 #define REG_ACCEL_XOUT_H 0x3B
 
-// 按钮管脚（用于清零峰值，可选）
+// Button pin (optional)
 const int PIN_BTN = 2;
 
-// ±4g 量罩下的 LSB/g
+// Scale factor for ±4g: 8192 LSB/g
 const float ACC_SCALE = 8192.0f;
 
-// 简易低通滤波系数 (0【1)，越小越平滑
+// Simple low-pass (EMA) factor for display smoothing
 const float ALPHA = 0.20f;
 
-float ax_g=0, ay_g=0, az_g=0;        // 当前加速度 (g)
-float ax_f=0, ay_f=0, az_f=0;        // 滤波后
-float ax_off=0, ay_off=0, az_off=0;  // 零偏 (g)
-
+float ax_g=0, ay_g=0, az_g=0;        // current acceleration minus offset
+float ax_f=0, ay_f=0, az_f=0;        // filtered values
+float ax_off=0, ay_off=0, az_off=0;  // offsets learned at startup
 float peak_horiz = 0.0f;
 
 bool buttonLast = HIGH;
 unsigned long lastDebounce = 0;
 
-// 检测 I2C 设备是否存在
 bool i2cDevicePresent(uint8_t addr) {
   Wire.beginTransmission(addr);
   return (Wire.endTransmission() == 0);
 }
 
-// 写 MPU 存储器
 void mpuWrite(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(mpuAddr);
   Wire.write(reg);
@@ -66,7 +62,6 @@ void mpuWrite(uint8_t reg, uint8_t val) {
   Wire.endTransmission();
 }
 
-// 读 MPU 多字节
 void mpuReadBytes(uint8_t startReg, uint8_t *buf, size_t len) {
   Wire.beginTransmission(mpuAddr);
   Wire.write(startReg);
@@ -77,38 +72,41 @@ void mpuReadBytes(uint8_t startReg, uint8_t *buf, size_t len) {
   }
 }
 
-// 初始化 MPU：探测地址，设罩量罩
 bool initMPU() {
-  // 探测 0x68 或 0x69
+  // detect address
   if (i2cDevicePresent(0x68)) mpuAddr = 0x68;
   else if (i2cDevicePresent(0x69)) mpuAddr = 0x69;
   else return false;
-  // 唤醒
+
+  // wake up
   mpuWrite(REG_PWR_MGMT_1, 0x00);
   delay(50);
-  // 设罩 ±4g (FS_SEL = 1)
+
+  // set accel ±4g: FS_SEL = 01 (bits 4:3)
   uint8_t cur=0;
   mpuReadBytes(REG_ACCEL_CONFIG, &cur, 1);
   cur &= ~0x18;
   cur |= (1 << 3);
   mpuWrite(REG_ACCEL_CONFIG, cur);
   delay(10);
+
   return true;
 }
 
-// 读取加速度（单位:g）
+// read acceleration in g
 void readAccelG(float &ax, float &ay, float &az) {
   uint8_t buf[6];
   mpuReadBytes(REG_ACCEL_XOUT_H, buf, 6);
   int16_t ax_raw = (int16_t)((buf[0] << 8) | buf[1]);
   int16_t ay_raw = (int16_t)((buf[2] << 8) | buf[3]);
   int16_t az_raw = (int16_t)((buf[4] << 8) | buf[5]);
+
   ax = (float)ax_raw / ACC_SCALE;
   ay = (float)ay_raw / ACC_SCALE;
   az = (float)az_raw / ACC_SCALE;
 }
 
-// 校准零偏：静止采样若干次
+// calibrate offsets with N samples (~2.5s at default)
 void calibrateOffsets(unsigned samples=500, unsigned msWait=5) {
   float sx=0, sy=0, sz=0;
   for (unsigned i=0; i<samples; i++) {
@@ -119,10 +117,10 @@ void calibrateOffsets(unsigned samples=500, unsigned msWait=5) {
   }
   ax_off = sx / samples;
   ay_off = sy / samples;
-  az_off = sz / samples;
+  az_off = sz / samples;  // includes +1g
 }
 
-// 绘制水平条形图（中心为零，左右两侧代表±g）
+// existing bar graph function (unused if using G-ball)
 void drawBarH(int x, int y, int w, int h, float gVal, float gFullScale) {
   display.drawRect(x, y, w, h, SSD1306_WHITE);
   int mid = x + w/2;
@@ -134,17 +132,43 @@ void drawBarH(int x, int y, int w, int h, float gVal, float gFullScale) {
   } else {
     display.fillRect(mid+span, y+1, -span, h-2, SSD1306_WHITE);
   }
-  // ±1g 制度
-  int tick = (w/2)/gFullScale;
-  display.drawFastVLine(mid + tick*1, y, h, SSD1306_WHITE);
-  display.drawFastVLine(mid - tick*1, y, h, SSD1306_WHITE);
+  int tick1p = mid + (w/2)/gFullScale * 1.0f;
+  int tick1n = mid - (w/2)/gFullScale * 1.0f;
+  display.drawFastVLine(tick1p, y, h, SSD1306_WHITE);
+  display.drawFastVLine(tick1n, y, h, SSD1306_WHITE);
 }
+
+void drawGBall(int cx, int cy, int radius, float ax, float ay, float maxVal) {
+  // 圆形边框
+  display.drawCircle(cx, cy, radius, SSD1306_WHITE);
+  // 十字线
+  display.drawLine(cx - radius, cy, cx + radius, cy, SSD1306_WHITE);
+  display.drawLine(cx, cy - radius, cx, cy + radius, SSD1306_WHITE);
+
+  // ==== 新增：前进方向标记（小三角形）====
+  int fx = cx + radius;     // 圆右边
+  int fy = cy;
+  display.fillTriangle(fx, fy, fx-4, fy-3, fx-4, fy+3, SSD1306_WHITE);
+
+  // 将加速度值映射到圆内
+  float px = ax / maxVal;
+  float py = ay / maxVal;
+  if (px < -1) px = -1; if (px > 1) px = 1;
+  if (py < -1) py = -1; if (py > 1) py = 1;
+  int x = cx + (int)(px * radius);
+  int y = cy - (int)(py * radius);
+  // 加速度点
+  display.fillCircle(x, y, 3, SSD1306_WHITE);
+}
+
 
 void setup() {
   pinMode(PIN_BTN, INPUT_PULLUP);
+
   Wire.begin();
   Wire.setClock(400000);
-  // OLED 初始化（尝试 0x3C 或 0x3D）
+
+  // OLED init (try 0x3C/0x3D)
   if (!i2cDevicePresent(OLED_ADDR)) {
     OLED_ADDR = 0x3D;
   }
@@ -155,14 +179,16 @@ void setup() {
   display.setCursor(0, 0);
   display.println(F("Car G-Meter"));
   display.display();
-  // 初始化 MPU
+
+  // MPU init
   if (!initMPU()) {
     display.setCursor(0, 16);
     display.println(F("MPU NOT FOUND"));
     display.display();
     while (1) { delay(1000); }
   }
-  // 校准：静置 2.5s
+
+  // calibration: keep still for ~2.5 seconds
   display.setCursor(0, 16);
   display.println(F("Calibrating..."));
   display.display();
@@ -174,18 +200,20 @@ void setup() {
 void loop() {
   float x,y,z;
   readAccelG(x,y,z);
-  // 去零偏
+
+  // 去零偏 & 平滑
   ax_g = x - ax_off;
   ay_g = y - ay_off;
   az_g = z - az_off;
-  // EMA 滤波
+
   ax_f = ALPHA*ax_g + (1-ALPHA)*ax_f;
   ay_f = ALPHA*ay_g + (1-ALPHA)*ay_f;
   az_f = ALPHA*az_g + (1-ALPHA)*az_f;
-  // 水平向量合成
+
   float g_horiz = sqrtf(ax_f*ax_f + ay_f*ay_f);
   if (g_horiz > peak_horiz) peak_horiz = g_horiz;
-  // 按钮复位峰值
+
+  // 可选按钮清零峰值
   bool b = digitalRead(PIN_BTN);
   if (b != buttonLast) {
     lastDebounce = millis();
@@ -194,18 +222,16 @@ void loop() {
   if (buttonLast == LOW && (millis() - lastDebounce) > 30) {
     peak_horiz = 0.0f;
   }
-  // OLED 显示
+
+  // 显示 G 力球
   display.clearDisplay();
-  display.setCursor(0, 0);
-  display.print(F("X(Long): ")); display.print(ax_f, 2); display.println(F("g"));
-  display.print(F("Y(Lat) : ")); display.print(ay_f, 2); display.println(F("g"));
-  display.print(F("Z(Vert): ")); display.print(az_f, 2); display.println(F("g"));
-  display.print(F("|H|   : ")); display.print(g_horiz, 2); display.println(F("g"));
-  display.print(F("Peak  : ")); display.print(peak_horiz, 2); display.println(F("g"));
-  // 条形图（±2g）
-  drawBarH(0, 48, 124, 14, ay_f, 2.0f);
-  display.setCursor(126-6*3, 48);
-  display.print(F("Lat"));
+  // 在调用 drawGBall 前，加这两行坐标变换
+  float ax_r = -ay_f; // 左转90°后的X
+  float ay_r =  ax_f; // 左转90°后的Y
+
+  drawGBall(64, 32, 28, ax_f, ay_f, 2.0f); // 居中，半径 28 像素
   display.display();
-  delay(20);
+
+  delay(20); // ~50 Hz 刷新
 }
+
