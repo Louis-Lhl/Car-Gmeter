@@ -1,0 +1,9 @@
+# 通用忽略
+.DS_Store
+*.tmp
+*.log
+build/
+*.bin
+*.elf
+*.map
+.vscode/
